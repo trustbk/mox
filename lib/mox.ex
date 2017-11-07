@@ -88,8 +88,17 @@ defmodule Mox do
 
   ## Multi-process collaboration
 
-  Mox supports multi-process collaboration via an explicit allowances
-  where a child process is allowed to use the expectations and stubs
+  Mox supports multi-process collaboration via two mechanisms:
+
+    1. explicit allowances
+    2. global mode
+
+  The allowance mechanism can still run tests concurrently while
+  the global ones doesn't. We explore both next.
+
+  ### Explicit allowances
+
+  An allowance permits a child process to use the expectations and stubs
   defined in the parent process while still being safe for async tests.
 
       test "invokes add and mult from a task" do
@@ -107,6 +116,38 @@ defmodule Mox do
         |> Task.await
       end
 
+  ### Global mode
+
+  Mox supports global mode, where any process can consume mocks and stubs
+  defined in your tests. To manually switch to global mode use:
+
+      set_mox_global()
+
+  which can be done as a setup callback:
+
+      setup :set_mox_global
+
+      test "invokes add and mult from a task" do
+        MyApp.CalcMock
+        |> expect(:add, fn x, y -> x + y end)
+        |> expect(:mult, fn x, y -> x * y end)
+
+        Task.async(fn ->
+          assert MyApp.CalcMock.add(2, 3) == 5
+          assert MyApp.CalcMock.mult(2, 3) == 6
+        end)
+        |> Task.await
+      end
+
+  The default mode is `private` and the global mode must always be explicit
+  set per test.
+
+  You can also automatically choose global or private mode depending on
+  if your tests run in async mode or not with. In such case Mox will use
+  private mode when `async: true`, global mode otherwise:
+
+      setup :set_mox_from_context
+
   """
 
   defmodule UnexpectedCallError do
@@ -118,6 +159,35 @@ defmodule Mox do
   end
 
   @doc """
+  Sets the Mox to private mode, where mocks can be set and
+  consumed by the same process unless other processes are
+  explicitly allowed.
+
+      setup :set_mox_private
+
+  """
+  def set_mox_private(_context \\ %{}), do: Mox.Server.set_mode(self(), :private)
+
+  @doc """
+  Sets the Mox to global mode, where mocks can be consumed
+  by any process.
+
+      setup :set_mox_global
+
+  """
+  def set_mox_global(_context \\ %{}), do: Mox.Server.set_mode(self(), :global)
+
+  @doc """
+  Chooses the Mox mode based on context. When `async: true` is used
+  the mode is `:private`, otherwise `:global` is chosen.
+
+      setup :set_mox_from_context
+
+  """
+  def set_mox_from_context(%{async: true} = _context), do: set_mox_private()
+  def set_mox_from_context(_context), do: set_mox_global()
+
+  @doc """
   Defines a mock with the given name `:for` the given behaviour.
 
       Mox.defmock MyMock, for: MyBehaviour
@@ -125,30 +195,47 @@ defmodule Mox do
   """
   def defmock(name, options) when is_atom(name) and is_list(options) do
     behaviour = options[:for] || raise ArgumentError, ":for option is required on defmock"
-    validate_behaviour!(behaviour)
-    define_mock_module(name, behaviour)
+    validate_module!(behaviour)
+    define_mock_module(name, behaviour, behaviour.behaviour_info(:callbacks))
     name
   end
 
-  defp validate_behaviour!(behaviour) do
+  @doc """
+  Defines a mock with the given name `:for` the given module.
+
+  Please note that this is not recommanded and you should always define a proper contract for the
+  module you want to use as a mock.
+
+      Mox.defmock_without_behaviour MyMock, for: MyModule
+
+  """
+  def defmock_without_behaviour(name, options) do
+    module = options[:for] || raise ArgumentError, ":for option is required on defmock"
+    validate_module!(module, behaviour?: false)
+    define_mock_module(name, module, module.__info__(:functions))
+    name
+  end
+
+  defp validate_module!(behaviour, options \\ []) do
+    behaviour? = Keyword.get(options, :behaviour?, true)
     cond do
       not Code.ensure_compiled?(behaviour) ->
         raise ArgumentError,
-              "module #{inspect behaviour} is not available, please pass an existing module to :for"
+              "module #{inspect(behaviour)} is not available, please pass an existing module to :for"
 
-      not function_exported?(behaviour, :behaviour_info, 1) ->
+      behaviour? and not function_exported?(behaviour, :behaviour_info, 1) ->
         raise ArgumentError,
-              "module #{inspect behaviour} is not a behaviour, please pass a behaviour to :for"
+              "module #{inspect(behaviour)} is not a behaviour, please pass a behaviour to :for"
 
       true ->
         :ok
     end
   end
 
-  defp define_mock_module(name, behaviour) do
+  defp define_mock_module(name, behaviour, functions) do
     funs =
-      for {fun, arity} <- behaviour.behaviour_info(:callbacks) do
-        args = 0..arity |> Enum.to_list |> tl() |> Enum.map(&Macro.var(:"arg#{&1}", Elixir))
+      for {fun, arity} <- functions do
+        args = 0..arity |> Enum.to_list() |> tl() |> Enum.map(&Macro.var(:"arg#{&1}", Elixir))
         quote do
           def unquote(fun)(unquote_splicing(args)) do
             Mox.__dispatch__(__MODULE__, unquote(fun), unquote(arity), unquote(args))
@@ -221,7 +308,7 @@ defmodule Mox do
     key = {mock, name, arity}
 
     unless function_exported?(mock, name, arity) do
-      raise ArgumentError, "unknown function #{name}/#{arity} for mock #{inspect mock}"
+      raise ArgumentError, "unknown function #{name}/#{arity} for mock #{inspect(mock)}"
     end
 
     case Mox.Server.add_expectation(self(), key, value) do
@@ -232,10 +319,18 @@ defmodule Mox do
         inspected = inspect(self())
 
         raise ArgumentError, """
-        cannot add expectations/stubs to #{inspect mock} in the current process (#{inspected})
-        because the process has been allowed by #{inspect owner_pid}.
+        cannot add expectations/stubs to #{inspect(mock)} in the current process (#{inspected}) \
+        because the process has been allowed by #{inspect(owner_pid)}. \
+        You cannot define expectations/stubs in a process that has been allowed
+        """
 
-        Note you cannot mix allowances with expectations/stubs
+      {:error, {:not_global_owner, global_pid}} ->
+        inspected = inspect(self())
+
+        raise ArgumentError, """
+        cannot add expectations/stubs to #{inspect(mock)} in the current process (#{inspected}) \
+        because Mox is in global mode and the global process is #{inspect(global_pid)}. \
+        Only the process that set Mox to global can set expectations/stubs in global mode
         """
     end
   end
@@ -263,19 +358,26 @@ defmodule Mox do
 
       {:error, {:already_allowed, actual_pid}} ->
         raise ArgumentError, """
-        cannot allow #{inspect allowed_pid} to use #{inspect mock} from #{inspect owner_pid}
-        because it is already allowed by #{inspect actual_pid}.
+        cannot allow #{inspect(allowed_pid)} to use #{inspect(mock)} from #{inspect(owner_pid)} \
+        because it is already allowed by #{inspect(actual_pid)}.
 
-        If you are seeing this error message, it is because you are either
-        setting up allowances from different processes or your tests have
-        async: true and you found a race condition where two different tests
+        If you are seeing this error message, it is because you are either \
+        setting up allowances from different processes or your tests have \
+        async: true and you found a race condition where two different tests \
         are allowing the same process
         """
 
       {:error, :expectations_defined} ->
         raise ArgumentError, """
-        cannot allow #{inspect allowed_pid} to use #{inspect mock} from #{inspect owner_pid}
+        cannot allow #{inspect(allowed_pid)} to use #{inspect(mock)} from #{inspect(owner_pid)} \
         because the process has already defined its own expectations/stubs
+        """
+
+      {:error, :in_global_mode} ->
+        raise ArgumentError, """
+        cannot allow #{inspect(allowed_pid)} to use #{inspect(mock)} from #{inspect(owner_pid)} \
+        because Mox is in global mode, the process already has access to all \
+        defined expectations/stubs
         """
     end
   end
@@ -286,6 +388,7 @@ defmodule Mox do
   def verify_on_exit!(_context \\ %{}) do
     pid = self()
     Mox.Server.verify_on_exit(pid)
+
     ExUnit.Callbacks.on_exit(Mox, fn ->
       verify_mock_or_all!(pid, :all)
       Mox.Server.exit(pid)
@@ -319,7 +422,8 @@ defmodule Mox do
       end
 
     if messages != [] do
-      raise VerificationError, "error while verifying mocks for #{inspect pid}:\n\n" <> Enum.join(messages, "\n")
+      raise VerificationError,
+            "error while verifying mocks for #{inspect(pid)}:\n\n" <> Enum.join(messages, "\n")
     end
 
     :ok
@@ -328,10 +432,10 @@ defmodule Mox do
   defp validate_mock!(mock) do
     cond do
       not Code.ensure_compiled?(mock) ->
-        raise ArgumentError, "module #{inspect mock} is not available"
+        raise ArgumentError, "module #{inspect(mock)} is not available"
 
       not function_exported?(mock, :__mock_for__, 0) ->
-        raise ArgumentError, "module #{inspect mock} is not a mock"
+        raise ArgumentError, "module #{inspect(mock)} is not a mock"
 
       true ->
         :ok
@@ -343,13 +447,16 @@ defmodule Mox do
     case Mox.Server.fetch_fun_to_dispatch(self(), {mock, name, arity}) do
       :no_expectation ->
         mfa = Exception.format_mfa(mock, name, arity)
-        raise UnexpectedCallError, "no expectation defined for #{mfa} in process #{inspect(self())}"
+
+        raise UnexpectedCallError,
+              "no expectation defined for #{mfa} in process #{inspect(self())}"
 
       {:out_of_expectations, count} ->
         mfa = Exception.format_mfa(mock, name, arity)
+
         raise UnexpectedCallError,
               "expected #{mfa} to be called #{times(count)} but it has been " <>
-              "called #{times(count + 1)} in process #{inspect(self())}"
+                "called #{times(count + 1)} in process #{inspect(self())}"
 
       {:ok, fun_to_call} ->
         apply(fun_to_call, args)

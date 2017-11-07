@@ -9,24 +9,47 @@ defmodule MoxTest do
     @callback mult(integer(), integer()) :: integer()
   end
 
-  defmock CalcMock, for: Calculator
+  defmodule CalculatorNoBehaviour do
+    def add(_a, _b), do: raise "should not be called"
+    def mult(_a, _b), do: raise "should not be called"
+  end
+
+  defmock(CalcMock, for: Calculator)
+  defmock_without_behaviour CalcMockNoBehaviour, for: CalculatorNoBehaviour
+
+  def in_all_modes(callback) do
+    set_mox_global()
+    callback.()
+    set_mox_private()
+    callback.()
+  end
 
   describe "defmock/2" do
     test "raises for unknown module" do
       assert_raise ArgumentError, ~r"module Unknown is not available", fn ->
-        defmock MyMock, for: Unknown
+        defmock(MyMock, for: Unknown)
       end
     end
 
     test "raises for non behaviour" do
       assert_raise ArgumentError, ~r"module String is not a behaviour", fn ->
-        defmock MyMock, for: String
+        defmock(MyMock, for: String)
+      end
+    end
+  end
+
+  describe "defmock_without_behaviour/2" do
+    test "raises for unknown module" do
+      assert_raise ArgumentError, ~r"module Unknown is not available", fn ->
+        defmock_without_behaviour MyMock, for: Unknown
       end
     end
   end
 
   describe "expect/4" do
-    test "is invoked n times" do
+    test "is invoked n times by the same process in private mode" do
+      set_mox_private()
+
       CalcMock
       |> expect(:add, 2, fn x, y -> x + y end)
       |> expect(:mult, fn x, y -> x * y end)
@@ -38,12 +61,54 @@ defmodule MoxTest do
       assert CalcMock.mult(3, 2) == 6
     end
 
+    test "is invoked n times by any process in global mode" do
+      set_mox_global()
+
+      CalcMock
+      |> expect(:add, 2, fn x, y -> x + y end)
+      |> expect(:mult, fn x, y -> x * y end)
+      |> expect(:add, fn _, _ -> 0 end)
+
+      task =
+        Task.async(fn ->
+          assert CalcMock.add(2, 3) == 5
+          assert CalcMock.add(3, 2) == 5
+        end)
+
+      Task.await(task)
+
+      assert CalcMock.add(:whatever, :whatever) == 0
+      assert CalcMock.mult(3, 2) == 6
+    end
+
     test "can be recharged" do
       expect(CalcMock, :add, fn x, y -> x + y end)
       assert CalcMock.add(2, 3) == 5
 
       expect(CalcMock, :add, fn x, y -> x + y end)
       assert CalcMock.add(3, 2) == 5
+    end
+
+    test "expectations are reclaimed if the global process dies" do
+      task =
+        Task.async(fn ->
+          set_mox_global()
+
+          CalcMock
+          |> expect(:add, fn _, _ -> :expected end)
+          |> stub(:mult, fn _, _ -> :stubbed end)
+        end)
+
+      Task.await(task)
+
+      assert_raise Mox.UnexpectedCallError, fn ->
+        CalcMock.add(1, 1)
+      end
+
+      CalcMock
+      |> expect(:add, 1, fn x, y -> x + y end)
+
+      assert CalcMock.add(1, 1) == 2
     end
 
     test "raises if a non-mock is given" do
@@ -66,6 +131,12 @@ defmodule MoxTest do
       end
     end
 
+    test "raises if function is not in module" do
+      assert_raise ArgumentError, ~r"unknown function add/3 for mock CalcMock", fn ->
+        expect(CalcMockNoBehaviour, :add, fn x, y, z -> x + y + z end)
+      end
+    end
+
     test "raises if there is no expectation" do
       assert_raise Mox.UnexpectedCallError, ~r"no expectation defined for CalcMock\.add/2", fn ->
         CalcMock.add(2, 3) == 5
@@ -83,14 +154,33 @@ defmodule MoxTest do
       expect(CalcMock, :add, fn x, y -> x + y end)
       assert CalcMock.add(2, 3) == 5
 
-      assert_raise Mox.UnexpectedCallError, ~r"expected CalcMock.add/2 to be called 2 times", fn ->
+      msg = ~r"expected CalcMock.add/2 to be called 2 times"
+
+      assert_raise Mox.UnexpectedCallError, msg, fn ->
         CalcMock.add(2, 3) == 5
       end
+    end
+
+    test "raises if you try to add expectations from non global process" do
+      set_mox_global()
+
+      Task.async(fn ->
+        msg =
+          ~r"Only the process that set Mox to global can set expectations/stubs in global mode"
+
+        assert_raise ArgumentError, msg, fn ->
+          CalcMock
+          |> expect(:add, fn _, _ -> :expected end)
+        end
+      end)
+      |> Task.await()
     end
   end
 
   describe "verify!/0" do
-    test "verifies all mocks for the current process" do
+    test "verifies all mocks for the current process in private mode" do
+      set_mox_private()
+
       verify!()
       expect(CalcMock, :add, fn x, y -> x + y end)
 
@@ -104,10 +194,35 @@ defmodule MoxTest do
       message = ~r"expected CalcMock.add/2 to be invoked 2 times but it was invoked once"
       assert_raise Mox.VerificationError, message, &verify!/0
     end
+
+    test "verifies all mocks for the current process in global mode" do
+      set_mox_global()
+
+      verify!()
+      expect(CalcMock, :add, fn x, y -> x + y end)
+
+      message = ~r"expected CalcMock.add/2 to be invoked once but it was invoked 0 times"
+      assert_raise Mox.VerificationError, message, &verify!/0
+
+      task =
+        Task.async(fn ->
+          assert CalcMock.add(2, 3) == 5
+        end)
+
+      Task.await(task)
+
+      verify!()
+      expect(CalcMock, :add, fn x, y -> x + y end)
+
+      message = ~r"expected CalcMock.add/2 to be invoked 2 times but it was invoked once"
+      assert_raise Mox.VerificationError, message, &verify!/0
+    end
   end
 
   describe "verify!/1" do
-    test "verifies all mocks for the current process" do
+    test "verifies all mocks for the current process in private mode" do
+      set_mox_private()
+
       verify!(CalcMock)
       expect(CalcMock, :add, fn x, y -> x + y end)
 
@@ -115,6 +230,29 @@ defmodule MoxTest do
       assert_raise Mox.VerificationError, message, &verify!/0
 
       assert CalcMock.add(2, 3) == 5
+      verify!(CalcMock)
+      expect(CalcMock, :add, fn x, y -> x + y end)
+
+      message = ~r"expected CalcMock.add/2 to be invoked 2 times but it was invoked once"
+      assert_raise Mox.VerificationError, message, &verify!/0
+    end
+
+    test "verifies all mocks for current process in global mode" do
+      set_mox_global()
+
+      verify!(CalcMock)
+      expect(CalcMock, :add, fn x, y -> x + y end)
+
+      message = ~r"expected CalcMock.add/2 to be invoked once but it was invoked 0 times"
+      assert_raise Mox.VerificationError, message, &verify!/0
+
+      task =
+        Task.async(fn ->
+          assert CalcMock.add(2, 3) == 5
+        end)
+
+      Task.await(task)
+
       verify!(CalcMock)
       expect(CalcMock, :add, fn x, y -> x + y end)
 
@@ -136,81 +274,136 @@ defmodule MoxTest do
   describe "verify_on_exit!/0" do
     setup :verify_on_exit!
 
-    test "verifies all mocks even if none is used" do
+    test "verifies all mocks even if none is used in private mode" do
+      set_mox_private()
       :ok
     end
 
-    test "verifies all mocks for the current process on exit" do
+    test "verifies all mocks for the current process on exit in private mode" do
+      set_mox_private()
+
       expect(CalcMock, :add, fn x, y -> x + y end)
       assert CalcMock.add(2, 3) == 5
     end
 
-    test "verifies all mocks for the current process on exit with previous verification" do
+    test "verifies all mocks for the current process on exit with previous verification in private mode" do
+      set_mox_private()
+
       verify!()
       expect(CalcMock, :add, fn x, y -> x + y end)
       assert CalcMock.add(2, 3) == 5
+    end
+
+    test "verifies all mocks even if none is used in global mode" do
+      set_mox_global()
+      :ok
+    end
+
+    test "verifies all mocks for current process on exit in global mode" do
+      set_mox_global()
+
+      expect(CalcMock, :add, fn x, y -> x + y end)
+
+      task =
+        Task.async(fn ->
+          assert CalcMock.add(2, 3) == 5
+        end)
+
+      Task.await(task)
+    end
+
+    test "verifies all mocks for the current process on exit with previous verification in global mode" do
+      set_mox_global()
+
+      verify!()
+      expect(CalcMock, :add, fn x, y -> x + y end)
+
+      task =
+        Task.async(fn ->
+          assert CalcMock.add(2, 3) == 5
+        end)
+
+      Task.await(task)
     end
   end
 
   describe "stub/3" do
     test "allows repeated invocations" do
-      stub(CalcMock, :add, fn x, y -> x + y end)
-      assert CalcMock.add(1, 2) == 3
-      assert CalcMock.add(3, 4) == 7
+      in_all_modes(fn ->
+        stub(CalcMock, :add, fn x, y -> x + y end)
+        assert CalcMock.add(1, 2) == 3
+        assert CalcMock.add(3, 4) == 7
+      end)
     end
 
     test "does not fail verification if not called" do
-      stub(CalcMock, :add, fn x, y -> x + y end)
-      verify!()
+      in_all_modes(fn ->
+        stub(CalcMock, :add, fn x, y -> x + y end)
+        verify!()
+      end)
     end
 
     test "gives expected calls precedence" do
-      CalcMock
-      |> stub(:add, fn x, y -> x + y end)
-      |> expect(:add, fn _, _ -> :expected end)
-      assert CalcMock.add(1, 1) == :expected
-      verify!()
+      in_all_modes(fn ->
+        CalcMock
+        |> stub(:add, fn x, y -> x + y end)
+        |> expect(:add, fn _, _ -> :expected end)
+
+        assert CalcMock.add(1, 1) == :expected
+        verify!()
+      end)
     end
 
     test "invokes stub after expectations are fulfilled" do
-      CalcMock
-      |> stub(:add, fn _x, _y -> :stub end)
-      |> expect(:add, 2, fn _, _ -> :expected end)
-      assert CalcMock.add(1, 1) == :expected
-      assert CalcMock.add(1, 1) == :expected
-      assert CalcMock.add(1, 1) == :stub
-      verify!()
+      in_all_modes(fn ->
+        CalcMock
+        |> stub(:add, fn _x, _y -> :stub end)
+        |> expect(:add, 2, fn _, _ -> :expected end)
+
+        assert CalcMock.add(1, 1) == :expected
+        assert CalcMock.add(1, 1) == :expected
+        assert CalcMock.add(1, 1) == :stub
+        verify!()
+      end)
     end
 
     test "overwrites earlier stubs" do
-      CalcMock
-      |> stub(:add, fn x, y -> x + y end)
-      |> stub(:add, fn _x, _y -> 42 end)
-      assert CalcMock.add(1, 1) == 42
+      in_all_modes(fn ->
+        CalcMock
+        |> stub(:add, fn x, y -> x + y end)
+        |> stub(:add, fn _x, _y -> 42 end)
+
+        assert CalcMock.add(1, 1) == 42
+      end)
     end
 
     test "raises if a non-mock is given" do
-      assert_raise ArgumentError, ~r"module Unknown is not available", fn ->
-        stub(Unknown, :add, fn x, y -> x + y end)
-      end
+      in_all_modes(fn ->
+        assert_raise ArgumentError, ~r"module Unknown is not available", fn ->
+          stub(Unknown, :add, fn x, y -> x + y end)
+        end
 
-      assert_raise ArgumentError, ~r"module String is not a mock", fn ->
-        stub(String, :add, fn x, y -> x + y end)
-      end
+        assert_raise ArgumentError, ~r"module String is not a mock", fn ->
+          stub(String, :add, fn x, y -> x + y end)
+        end
+      end)
     end
 
     test "raises if function is not in behaviour" do
-      assert_raise ArgumentError, ~r"unknown function oops/2 for mock CalcMock", fn ->
-        stub(CalcMock, :oops, fn x, y -> x + y end)
-      end
+      in_all_modes(fn ->
+        assert_raise ArgumentError, ~r"unknown function oops/2 for mock CalcMock", fn ->
+          stub(CalcMock, :oops, fn x, y -> x + y end)
+        end
 
-      assert_raise ArgumentError, ~r"unknown function add/3 for mock CalcMock", fn ->
-        stub(CalcMock, :add, fn x, y, z -> x + y + z end)
-      end
+        assert_raise ArgumentError, ~r"unknown function add/3 for mock CalcMock", fn ->
+          stub(CalcMock, :add, fn x, y, z -> x + y + z end)
+        end
+      end)
     end
   end
 
   describe "allow/3" do
+    setup :set_mox_private
     setup :verify_on_exit!
 
     test "allows different processes to share mocks from parent process" do
@@ -255,7 +448,8 @@ defmodule MoxTest do
 
         assert CalcMock.add(1, 1) == :expected
         assert CalcMock.mult(1, 1) == :stubbed
-      end) |> Task.await()
+      end)
+      |> Task.await()
     end
 
     test "allowances are transitive" do
@@ -264,6 +458,7 @@ defmodule MoxTest do
       {:ok, child_pid} =
         Task.start_link(fn ->
           assert_raise Mox.UnexpectedCallError, fn -> CalcMock.add(1, 1) end
+
           receive do
             :call_mock ->
               add_result = CalcMock.add(1, 1)
@@ -278,6 +473,7 @@ defmodule MoxTest do
             :allow_mock ->
               CalcMock
               |> allow(self(), child_pid)
+
               send(child_pid, :call_mock)
           end
         end)
@@ -382,6 +578,19 @@ defmodule MoxTest do
         CalcMock
         |> expect(:add, fn _, _ -> :expected end)
       end
+    end
+
+    test "raises if you try to allow process while in global mode" do
+      set_mox_global()
+      {:ok, child_pid} = Task.start_link(fn -> Process.sleep(:infinity) end)
+
+      Task.async(fn ->
+        assert_raise ArgumentError, ~r"already has access to all defined expectations", fn ->
+          CalcMock
+          |> allow(self(), child_pid)
+        end
+      end)
+      |> Task.await()
     end
   end
 end
